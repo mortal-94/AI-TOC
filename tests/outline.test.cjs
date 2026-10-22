@@ -4,7 +4,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require('playwright');
 
-const script = fs.readFileSync(path.join(__dirname, '..', 'ai-chat-outline.user.js'), 'utf8');
+const script = process.env.TEST_SCRIPT_REF
+  ? require('node:child_process').execFileSync('git', ['show', `${process.env.TEST_SCRIPT_REF}:ai-chat-outline.user.js`], { cwd: path.join(__dirname, '..'), encoding: 'utf8' })
+  : fs.readFileSync(path.join(__dirname, '..', 'ai-chat-outline.user.js'), 'utf8');
+const scriptVersion = /^\/\/ @version\s+(\S+)/m.exec(script)[1];
 let browser;
 const baseUrl = 'https://chatgpt.com';
 const fixtureHtml = '<!doctype html><html><head><style>body{margin:0}article{min-height:1100px;padding:50px;width:600px}h3{margin-top:450px}</style></head><body><main></main></body></html>';
@@ -55,7 +58,7 @@ async function setup(t, html, { denyStorage = false } = {}) {
       element.src = policy.createScriptURL('/userscript.js');
       document.body.append(element);
   });
-  await page.waitForFunction(() => window.AIChatOutline?.version === '1.0.6');
+  await page.waitForFunction((version) => window.AIChatOutline?.version === version, scriptVersion);
   assert.equal(await page.evaluate(() => AIChatOutline.getCurrentAdapter()), 'chatgpt');
   return { page, errors };
 }
@@ -72,7 +75,7 @@ async function state(page) {
 }
 
 async function waitCounter(page, text) {
-  await page.waitForFunction((value) => document.getElementById('ai-chat-outline-v1-host')?.shadowRoot.querySelector('.counter')?.textContent === value, text);
+  await page.waitForFunction((value) => document.getElementById('ai-chat-outline-v1-host')?.shadowRoot.querySelector('.counter')?.textContent === value, text, { timeout: 3000 });
 }
 
 test('Trusted Types 下创建面板，仅提取标题且默认最后回答', async (t) => {
@@ -105,6 +108,52 @@ test('延迟标记角色的水合节点可以识别', async (t) => {
   await page.evaluate(() => document.getElementById('late').setAttribute('data-turn', 'assistant'));
   await waitCounter(page, '1 / 1');
   assert.deepEqual((await state(page)).items, ['后到的回答']);
+});
+
+test('可见回答的祖先有 aria-hidden 也能识别与提取标题', async (t) => {
+  const { page } = await setup(t, `<div aria-hidden="true">${answer(1)}${answer(2)}</div>`);
+  await waitCounter(page, '2 / 2');
+  assert.deepEqual((await state(page)).items, ['标题 2', '小节 2']);
+  const diagnostics = await page.evaluate(() => AIChatOutline.getDiagnostics());
+  assert.equal(diagnostics.assistantUnderAriaHidden, 2);
+  assert.equal(diagnostics.answers, 2);
+});
+
+test('缺少 article 和 assistant 标记时识别 main 中的 markdown', async (t) => {
+  const { page } = await setup(t, '<div data-message-id="one"><div class="markdown"><h2>新布局回答一</h2></div><div class="markdown"><h3>同一回答的第二部分</h3></div></div><div data-message-id="two"><div class="markdown"><h2>新布局回答二</h2></div></div>');
+  await waitCounter(page, '2 / 2');
+  assert.deepEqual((await state(page)).items, ['新布局回答二']);
+  await page.evaluate(() => {
+    document.querySelector('[data-message-id="one"]').style.height = '1500px';
+    window.scrollTo(0, 100);
+  });
+  await waitCounter(page, '1 / 2');
+  assert.deepEqual((await state(page)).items, ['新布局回答一', '同一回答的第二部分']);
+});
+
+test('只有 role=main 的布局也识别正文，排除用户和隐藏备份', async (t) => {
+  const { page } = await setup(t, '<div class="markdown" data-turn="user"><h2>用户标题</h2></div><div hidden><div class="markdown"><h2>隐藏标题</h2></div></div><div class="markdown prose"><h2>可见回答</h2><div class="markdown"><h3>嵌套正文</h3></div></div>');
+  await page.evaluate(() => {
+    const main = document.querySelector('main');
+    const replacement = document.createElement('section');
+    replacement.setAttribute('role', 'main');
+    replacement.append(...main.childNodes);
+    main.replaceWith(replacement);
+  });
+  await waitCounter(page, '1 / 1');
+  assert.deepEqual((await state(page)).items, ['可见回答', '嵌套正文']);
+});
+
+test('无回答的识别诊断不包含正文，展开状态跨定时扫描保留', async (t) => {
+  const { page } = await setup(t, '<section id="unknown"><p>PRIVATE_CHAT_BODY_SENTINEL</p></section>');
+  await waitCounter(page, '暂无回答');
+  await page.locator('#ai-chat-outline-v1-host summary').click();
+  await page.waitForFunction(() => document.getElementById('ai-chat-outline-v1-host').shadowRoot.querySelector('pre')?.textContent);
+  const text = await page.locator('#ai-chat-outline-v1-host pre').textContent();
+  assert.equal(JSON.parse(text).answers, 0);
+  assert.equal(text.includes('PRIVATE_CHAT_BODY_SENTINEL'), false);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.locator('#ai-chat-outline-v1-host details').getAttribute('open'), '');
 });
 
 test('滚动切换回答，点击大纲后定位正确', async (t) => {

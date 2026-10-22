@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 聊天回答大纲（ChatGPT / 豆包）
 // @namespace    https://local.codex/ai-chat-outline
-// @version      1.0.6
+// @version      1.0.7
 // @description  为当前可见的 AI 回答生成侧边大纲；切换聊天时显示最后一个回答，滚动时自动切换。
 // @author       Codex
 // @homepageURL  https://github.com/mortal-94/AI-TOC
@@ -19,6 +19,7 @@
   'use strict';
 
   const APP_ID = 'ai-chat-outline-v1';
+  const VERSION = '1.0.7';
   const HOST_ID = `${APP_ID}-host`;
   const ANCHOR_ATTR = 'data-ai-chat-outline-anchor';
   const MAX_ITEMS = 80;
@@ -61,7 +62,7 @@
 
   const EXCLUDED_OUTLINE_SELECTOR = [
     'pre', 'code', 'table', 'svg', 'button', 'textarea', 'input',
-    '[contenteditable="true"]', '[aria-hidden="true"]',
+    '[contenteditable="true"]', '[hidden]:not([hidden="until-found"])',
     '[class*="suggest-message"]', '[class*="message-action"]',
     '[class*="toolbar"]', '[class*="operation"]',
   ].join(',');
@@ -94,6 +95,11 @@
     '[data-turn="user"]', '[data-testid="user-message"]',
   ].join(',');
   const MARKDOWN_SELECTOR = '.markdown, [class*="markdown"], [class*="prose"]';
+
+  function isHiddenMessage(element) {
+    // aria-hidden 仅控制无障碍树；ChatGPT 的可见聊天也可能位于这种容器内。
+    return Boolean(element.closest('[hidden]:not([hidden="until-found"])'));
+  }
 
   function cleanText(value) {
     return String(value || '')
@@ -153,16 +159,33 @@
       matches: () => /(^|\.)chatgpt\.com$|^chat\.openai\.com$/i.test(location.hostname),
       collectAnswers(root) {
         const roles = [...root.querySelectorAll(CHATGPT_ASSISTANT_SELECTOR)]
-          .filter((element) => !element.closest('[hidden], [aria-hidden="true"]'));
+          .filter((element) => !isHiddenMessage(element));
         // 保留最外层 assistant 节点，同一回答中的多个 markdown 片段统一提取。
         const answers = roles.filter((role) => !roles.some((other) => other !== role && other.contains(role)));
         // 兼容只保留 conversation-turn 标记的页面；明确排除用户消息。
         const turns = [...root.querySelectorAll('main article, main [data-testid^="conversation-turn-"], [data-turn="assistant"]')];
         for (const turn of turns) {
-          if (turn.closest('[hidden], [aria-hidden="true"]')) continue;
+          if (isHiddenMessage(turn)) continue;
           if (turn.matches(CHATGPT_USER_SELECTOR) || turn.querySelector(CHATGPT_USER_SELECTOR)) continue;
           if (answers.some((answer) => turn.contains(answer) || answer.contains(turn))) continue;
           if (turn.querySelector(MARKDOWN_SELECTOR)) answers.push(turn);
+        }
+        // 新布局可能只有 markdown 正文而没有 article/conversation-turn 外壳。
+        // 逐段回溯至消息边界，既不依赖具体标签名，也不跨越用户消息。
+        const mainRoots = [...root.querySelectorAll('main, [role="main"], #thread')];
+        for (const main of mainRoots) {
+          for (const markdown of main.querySelectorAll(MARKDOWN_SELECTOR)) {
+            if (isHiddenMessage(markdown) || markdown.closest(CHATGPT_USER_SELECTOR)) continue;
+            if (markdown.closest(EXCLUDED_OUTLINE_SELECTOR)) continue;
+            const markdownParent = markdown.parentElement?.closest(MARKDOWN_SELECTOR);
+            if (markdownParent && markdownParent !== main && main.contains(markdownParent)) continue;
+            if (answers.some((answer) => answer.contains(markdown) || markdown.contains(answer))) continue;
+            const boundary = markdown.closest('[data-message-id], [data-turn-id], [data-testid^="conversation-turn-"], article');
+            const answer = boundary && main.contains(boundary)
+              && !boundary.matches(CHATGPT_USER_SELECTOR) && !boundary.querySelector(CHATGPT_USER_SELECTOR)
+              ? boundary : markdown;
+            if (!answers.some((existing) => existing === answer || existing.contains(answer))) answers.push(answer);
+          }
         }
         return uniqueElements(answers).filter((answer) => elementTextLength(answer) > 0)
           .sort(domOrder);
@@ -395,7 +418,7 @@
   }
 
   function isExcludedNode(element, contentRoot) {
-    if (element.closest('[hidden], [aria-hidden="true"], [data-testid*="thinking"], [data-testid*="reasoning"]')) return true;
+    if (element.closest('[hidden]:not([hidden="until-found"]), [data-testid*="thinking"], [data-testid*="reasoning"]')) return true;
     const excluded = element.closest(EXCLUDED_OUTLINE_SELECTOR);
     return Boolean(excluded && contentRoot.contains(excluded));
   }
@@ -481,7 +504,7 @@
 
   function renderOutline(force = false) {
     if (!state.ui) return;
-    state.ui.site.textContent = state.adapter?.label || 'AI Chat';
+    state.ui.site.textContent = `${state.adapter?.label || 'AI Chat'} · ${VERSION}`;
 
     const currentIndex = state.answers.indexOf(state.currentAnswer);
     state.ui.counter.textContent = currentIndex >= 0
@@ -556,10 +579,43 @@
   }
 
   function showEmpty(message) {
+    const existing = state.ui.body.querySelector('.empty');
+    const detailsExist = Boolean(state.ui.body.querySelector('details'));
+    if (existing?.textContent === message && detailsExist === !state.answers.length) return;
     const empty = document.createElement('div');
     empty.className = 'empty';
     empty.textContent = message;
     state.ui.body.replaceChildren(empty);
+    if (!state.answers.length) {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = '识别诊断（不含聊天正文）';
+      const diagnostic = document.createElement('pre');
+      diagnostic.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;margin:8px 0';
+      const refreshDiagnostic = () => { diagnostic.textContent = JSON.stringify(getDiagnostics(), null, 2); };
+      details.addEventListener('toggle', () => { if (details.open) refreshDiagnostic(); });
+      details.append(summary, diagnostic);
+      state.ui.body.append(details);
+    }
+  }
+
+  function getDiagnostics() {
+    const count = (selector) => document.querySelectorAll(selector).length;
+    const roles = [...document.querySelectorAll(CHATGPT_ASSISTANT_SELECTOR)];
+    return {
+      version: VERSION,
+      site: location.hostname,
+      adapter: state.adapter?.id,
+      answers: state.answers.length,
+      assistantMarkers: roles.length,
+      assistantUnderAriaHidden: roles.filter((role) => role.closest('[aria-hidden="true"]')).length,
+      assistantUnderHidden: roles.filter(isHiddenMessage).length,
+      conversationTurns: count('[data-testid^="conversation-turn-"]'),
+      markdownBlocks: count(MARKDOWN_SELECTOR),
+      mainRegions: count('main, [role="main"], #thread'),
+      headings: count('main h1, main h2, main h3, main h4, main h5, main h6, [role="main"] [role="heading"]'),
+      frames: count('iframe'),
+    };
   }
 
   function setActiveItem(item, ensureVisible = false) {
@@ -803,11 +859,12 @@
     }, 1000);
 
     const api = {
-      version: '1.0.6',
+      version: VERSION,
       registerAdapter,
       refresh: () => scheduleScan(0),
       destroy,
       getCurrentAdapter: () => state.adapter?.id || null,
+      getDiagnostics,
     };
     window.__AI_CHAT_OUTLINE__ = api;
     window.AIChatOutline = api;
