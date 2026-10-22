@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 聊天回答大纲（ChatGPT / 豆包）
 // @namespace    https://local.codex/ai-chat-outline
-// @version      1.0.8
+// @version      1.0.9
 // @description  为当前可见的 AI 回答生成侧边大纲；切换聊天时显示最后一个回答，滚动时自动切换。
 // @author       Codex
 // @homepageURL  https://github.com/mortal-94/AI-TOC
@@ -19,10 +19,11 @@
   'use strict';
 
   const APP_ID = 'ai-chat-outline-v1';
-  const VERSION = '1.0.8';
+  const VERSION = '1.0.9';
   const HOST_ID = `${APP_ID}-host`;
   const ANCHOR_ATTR = 'data-ai-chat-outline-anchor';
-  const MAX_ITEMS = 80;
+  const PAGE_SIZE = 80;
+  const DEFAULT_EXPANDED_DEPTH = 3;
   const ROUTE_SETTLE_MS = 700;
   const STORAGE_KEY = `${APP_ID}:collapsed`;
 
@@ -41,6 +42,8 @@
     currentAnswer: null,
     items: [],
     activeItem: null,
+    outlineViews: new WeakMap(),
+    outlineView: null,
     routeKey: routeKey(),
     preferLastAnswer: true,
     preferLastUntil: 0,
@@ -392,12 +395,18 @@
         .body { min-height: 56px; overflow: auto; padding: 8px; scrollbar-width: thin; }
         .empty { padding: 16px 10px; color: var(--muted); text-align: center; line-height: 1.65; }
         .outline { display: flex; flex-direction: column; gap: 2px; }
-        .item { position: relative; width: 100%; min-height: 30px; padding: 6px 8px 6px calc(9px + var(--indent, 0px)); color: var(--muted); background: transparent; border: 0; border-radius: 8px; text-align: left; font: inherit; line-height: 1.4; cursor: pointer; overflow-wrap: anywhere; }
-        .item::before { content: ""; position: absolute; left: calc(3px + var(--indent, 0px)); top: 9px; bottom: 9px; width: 2px; border-radius: 2px; background: transparent; }
+        .outline-row { display: flex; align-items: flex-start; padding-left: var(--indent, 0px); }
+        .branch-toggle, .branch-spacer { width: 22px; min-width: 22px; height: 30px; }
+        .branch-toggle { border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
+        .branch-toggle:hover { background: var(--surface); color: var(--text); }
+        .item { position: relative; flex: 1; min-width: 0; min-height: 30px; padding: 6px 8px 6px 9px; color: var(--muted); background: transparent; border: 0; border-radius: 8px; text-align: left; font: inherit; line-height: 1.4; cursor: pointer; overflow-wrap: anywhere; }
+        .item::before { content: ""; position: absolute; left: 3px; top: 9px; bottom: 9px; width: 2px; border-radius: 2px; background: transparent; }
         .item:hover { color: var(--text); background: var(--surface); }
         .item.active { color: var(--text); background: color-mix(in srgb, var(--accent) 11%, transparent); }
         .item.active::before { background: var(--accent); }
         .item[data-level="1"], .item[data-level="2"] { font-weight: 650; color: var(--text); }
+        .outline-status { padding: 8px 9px; color: var(--muted); font-size: 11px; }
+        .load-more { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; font: inherit; }
         .footer { padding: 7px 12px 9px; color: var(--muted); border-top: 1px solid var(--line); font-size: 11px; display: flex; justify-content: space-between; gap: 8px; }
         @media (max-width: 900px) {
           .panel:not(.collapsed) { top: 62px; right: 8px; width: min(290px, calc(100vw - 16px)); max-height: calc(100vh - 82px); }
@@ -491,18 +500,20 @@
     // 不遍历回答中的每一个 div/p。长回答里对大量通用容器逐个读取
     // 文本会放大为昂贵的整页布局工作；只收集真正的标题和可能的
     // “整段加粗标题”父节点即可。
-    const headings = [...contentRoot.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]')];
-    const strongTitleParents = [...contentRoot.querySelectorAll('p > strong, p > b, div > strong, div > b')]
-      .map((element) => element.parentElement)
-      .filter(Boolean);
-    const structural = uniqueElements([...headings, ...strongTitleParents])
+    const headings = [...contentRoot.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]')]
+      .filter((element) => !isExcludedNode(element, contentRoot) && cleanText(element.textContent));
+    const inferred = !headings.length;
+    const candidates = inferred
+      ? [...contentRoot.querySelectorAll('p > strong, p > b, div > strong, div > b')]
+        .map((element) => element.parentElement).filter((element) => element && isStandaloneStrongTitle(element))
+      : headings;
+    const structural = uniqueElements(candidates)
       .filter((element) => !isExcludedNode(element, contentRoot))
-      .filter((element) => element.matches('h1, h2, h3, h4, h5, h6, [role="heading"]') || isStandaloneStrongTitle(element))
       .map((element) => ({
         element,
         text: shorten(element.textContent),
         level: nodeLevel(element, 3),
-        inferred: isStandaloneStrongTitle(element),
+        inferred,
       }))
       .filter((item) => item.text)
       .sort((a, b) => domOrder(a.element, b.element));
@@ -513,10 +524,18 @@
     if (!items.length) return [];
 
     const baseLevel = Math.min(...items.map((item) => item.level));
-    return items.slice(0, MAX_ITEMS).map((item) => ({
+    const normalized = items.map((item) => ({
       ...item,
-      level: Math.max(1, Math.min(4, item.level - baseLevel + 1)),
+      level: Math.max(1, Math.min(6, item.level - baseLevel + 1)),
     }));
+    const parents = [];
+    normalized.forEach((item, index) => {
+      while (parents.length && normalized[parents[parents.length - 1]].level >= item.level) parents.pop();
+      item.parentIndex = parents.length ? parents[parents.length - 1] : -1;
+      item.depth = parents.length + 1;
+      parents.push(index);
+    });
+    return normalized;
   }
 
   function dedupeOutlineItems(items) {
@@ -524,7 +543,8 @@
     const result = [];
     for (const item of items) {
       if (seenElements.has(item.element)) continue;
-      if (result.length && result[result.length - 1].text === item.text) continue;
+      const previous = result[result.length - 1];
+      if (previous?.text === item.text && (previous.element.contains(item.element) || item.element.contains(previous.element))) continue;
       seenElements.add(item.element);
       result.push(item);
     }
@@ -592,15 +612,54 @@
       return;
     }
 
+    renderOutlineList();
+    updateActiveOutlineItem();
+  }
+
+  function isBranchCollapsed(item) {
+    return state.outlineView.collapsed.get(item.element) ?? item.depth >= DEFAULT_EXPANDED_DEPTH;
+  }
+
+  function renderOutlineList() {
+    if (!state.ui || !state.outlineView) return;
+    const scrollTop = state.ui.body.scrollTop;
     const list = document.createElement('div');
     list.className = 'outline';
-    state.items.forEach((item, index) => {
+    const visible = [];
+    const loaded = Math.min(state.outlineView.limit, state.items.length);
+    for (let index = 0; index < loaded; index += 1) {
+      const item = state.items[index];
+      const parent = state.items[item.parentIndex];
+      visible[index] = !parent || (visible[item.parentIndex] && !isBranchCollapsed(parent));
+      if (!visible[index]) continue;
+      const row = document.createElement('div');
+      row.className = 'outline-row';
+      row.dataset.index = String(index);
+      row.style.setProperty('--indent', `${(item.level - 1) * 12}px`);
+      const hasChildren = state.items[index + 1]?.parentIndex === index;
+      if (hasChildren) {
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'branch-toggle';
+        const collapsed = isBranchCollapsed(item);
+        toggle.textContent = collapsed ? '›' : '⌄';
+        toggle.setAttribute('aria-expanded', String(!collapsed));
+        toggle.setAttribute('aria-label', `${collapsed ? '展开' : '折叠'}“${item.text}”的子标题`);
+        toggle.addEventListener('click', () => {
+          state.outlineView.collapsed.set(item.element, !isBranchCollapsed(item));
+          renderOutlineList();
+        });
+        row.append(toggle);
+      } else {
+        const spacer = document.createElement('span');
+        spacer.className = 'branch-spacer';
+        row.append(spacer);
+      }
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'item';
       button.dataset.index = String(index);
       button.dataset.level = String(item.level);
-      button.style.setProperty('--indent', `${(item.level - 1) * 12}px`);
       button.textContent = item.text;
       button.title = cleanText(item.element.textContent);
       button.addEventListener('click', () => {
@@ -610,10 +669,27 @@
         });
         setActiveItem(item, true);
       });
-      list.appendChild(button);
-    });
+      row.append(button);
+      list.append(row);
+    }
+    const status = document.createElement('div');
+    status.className = 'outline-status';
+    status.textContent = `已加载 ${loaded} / ${state.items.length} 个标题`;
+    list.append(status);
+    if (loaded < state.items.length) {
+      const more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'load-more';
+      more.textContent = `加载更多（剩余 ${state.items.length - loaded} 条）`;
+      more.addEventListener('click', () => {
+        state.outlineView.limit += PAGE_SIZE;
+        renderOutlineList();
+      });
+      list.append(more);
+    }
     state.ui.body.replaceChildren(list);
-    updateActiveOutlineItem();
+    state.ui.body.scrollTop = scrollTop;
+    paintActiveItem();
   }
 
   function showEmpty(message) {
@@ -660,18 +736,40 @@
   }
 
   function setActiveItem(item, ensureVisible = false) {
-    if (!state.ui || item === state.activeItem) return;
-    state.activeItem = item;
+    if (!state.ui) return;
     const index = state.items.indexOf(item);
-    state.shadow.querySelectorAll('.item').forEach((button) => {
-      button.classList.toggle('active', Number(button.dataset.index) === index);
-    });
+    if (item === state.activeItem && (!ensureVisible || state.shadow.querySelector(`.item[data-index="${index}"]`))) return;
+    state.activeItem = item;
+    if (ensureVisible && index >= 0 && state.outlineView) {
+      let changed = false;
+      if (index >= state.outlineView.limit) {
+        state.outlineView.limit = Math.ceil((index + 1) / PAGE_SIZE) * PAGE_SIZE;
+        changed = true;
+      }
+      for (let parentIndex = item.parentIndex; parentIndex >= 0; parentIndex = state.items[parentIndex].parentIndex) {
+        const parent = state.items[parentIndex];
+        if (isBranchCollapsed(parent)) {
+          state.outlineView.collapsed.set(parent.element, false);
+          changed = true;
+        }
+      }
+      if (changed) renderOutlineList();
+    }
+    paintActiveItem();
     if (ensureVisible && index >= 0) {
       state.shadow.querySelector(`.item[data-index="${index}"]`)?.scrollIntoView({ block: 'nearest' });
     }
   }
 
-  function updateActiveOutlineItem() {
+  function paintActiveItem() {
+    let index = state.items.indexOf(state.activeItem);
+    while (index >= 0 && !state.shadow.querySelector(`.item[data-index="${index}"]`)) index = state.items[index].parentIndex;
+    state.shadow.querySelectorAll('.item').forEach((button) => {
+      button.classList.toggle('active', Number(button.dataset.index) === index);
+    });
+  }
+
+  function updateActiveOutlineItem(reveal = false) {
     if (!state.items.length) return;
     // 大纲点击使用 block: 'center'，因此高亮判定线也放在视口中央附近，
     // 避免平滑滚动完成后又误高亮到上一个小节。
@@ -683,7 +781,7 @@
       if (rect.top <= focusY) active = item;
       else break;
     }
-    setActiveItem(active, true);
+    setActiveItem(active, reveal);
   }
 
   function safeCollectAnswers() {
@@ -722,6 +820,8 @@
     if (changed) {
       state.contentTextSignature = '';
       state.contentSignature = '';
+      if (answer && !state.outlineViews.has(answer)) state.outlineViews.set(answer, { limit: PAGE_SIZE, collapsed: new WeakMap() });
+      state.outlineView = answer ? state.outlineViews.get(answer) : null;
     }
     if (force || changed) renderOutline(true);
   }
@@ -733,7 +833,7 @@
 
     if (fromScroll && !state.preferLastAnswer && state.answers.length && state.answers.every((answer) => answer.isConnected)) {
       setCurrentAnswer(answerNearViewport());
-      updateActiveOutlineItem();
+      updateActiveOutlineItem(true);
       return;
     }
 
@@ -757,7 +857,7 @@
 
     if (fromScroll) {
       setCurrentAnswer(answerNearViewport());
-      updateActiveOutlineItem();
+      updateActiveOutlineItem(true);
       return;
     }
 
@@ -795,6 +895,8 @@
     state.preferLastAnswer = true;
     state.preferLastUntil = Date.now() + ROUTE_SETTLE_MS;
     state.currentAnswer = null;
+    state.outlineViews = new WeakMap();
+    state.outlineView = null;
     clearTimeout(state.scanTimer);
     state.scanTimer = 0;
     state.answers = [];

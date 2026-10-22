@@ -351,3 +351,90 @@ test('空聊天显示提示，静止时不重复设置标题锚点', async (t) =
   await page.waitForTimeout(1200);
   assert.equal(await page.evaluate(() => window.anchorWrites), 0);
 });
+
+test('六级层次完整保留，默认前三层并可逐层展开、折叠和定位', async (t) => {
+  const html = '<article data-role="assistant">' + Array.from({ length: 6 }, (_, index) => `<h${index + 1}>第${index + 1}级</h${index + 1}>`).join('') + '</article>';
+  const { page, errors } = await setup(t, html);
+  await waitCounter(page, '1 / 1');
+  assert.deepEqual((await state(page)).items, ['第1级', '第2级', '第3级']);
+  for (const level of [3, 4, 5]) {
+    await page.getByRole('button', { name: `展开“第${level}级”的子标题`, exact: true }).click();
+  }
+  const levels = await page.locator('#ai-chat-outline-v1-host .item').evaluateAll((buttons) => buttons.map((button) => Number(button.dataset.level)));
+  assert.deepEqual(levels, [1, 2, 3, 4, 5, 6]);
+  await page.locator('#ai-chat-outline-v1-host .item[data-level="6"]').click();
+  await page.getByRole('button', { name: '折叠“第1级”的子标题', exact: true }).click();
+  assert.deepEqual((await state(page)).items, ['第1级']);
+  await page.getByRole('button', { name: '展开“第1级”的子标题', exact: true }).click();
+  assert.equal((await state(page)).items.length, 6);
+  assert.deepEqual(errors, []);
+});
+
+test('最浅标题归一级且跳级标题保持层次差异', async (t) => {
+  const { page } = await setup(t, '<article data-role="assistant"><h2>起始</h2><h4>跳级</h4><h6>最深</h6></article>');
+  await waitCounter(page, '1 / 1');
+  const levels = await page.locator('#ai-chat-outline-v1-host .item').evaluateAll((buttons) => buttons.map((button) => Number(button.dataset.level)));
+  assert.deepEqual(levels, [1, 3, 5]);
+});
+
+test('有正式或 ARIA 标题时不混入独立加粗正文', async (t) => {
+  const { page } = await setup(t, '<article data-role="assistant"><p><strong>加粗短句</strong></p><h2>正式标题</h2><div role="heading" aria-level="3">ARIA 小节</div><p><strong>另一个加粗短句</strong></p></article>');
+  await waitCounter(page, '1 / 1');
+  assert.deepEqual((await state(page)).items, ['正式标题', 'ARIA 小节']);
+});
+
+test('没有正式标题时才使用加粗短标题，sr-only 说话人不阻止备选', async (t) => {
+  const { page } = await setup(t, virtualTurn('bold', 'ChatGPT 说：', '<p><strong>备选标题一</strong></p><p>普通段落</p><p><strong>这是完整句子。</strong></p><p><b>备选标题二</b></p>'));
+  await waitCounter(page, '1 / 1');
+  assert.deepEqual((await state(page)).items, ['备选标题一', '备选标题二']);
+  await page.evaluate(() => {
+    const heading = document.createElement('h2');
+    heading.textContent = '生成中的正式标题';
+    document.querySelector('.block-BQZwFn').append(heading);
+  });
+  await page.waitForFunction(() => document.getElementById('ai-chat-outline-v1-host').shadowRoot.querySelectorAll('.item').length === 1);
+  assert.deepEqual((await state(page)).items, ['生成中的正式标题']);
+});
+
+test('超过 80 项明确提示并分批加载到末尾，不丢弃后半段标题', async (t) => {
+  const html = '<article data-role="assistant">' + Array.from({ length: 161 }, (_, index) => `<h2>条目 ${index + 1}</h2>`).join('') + '</article>';
+  const { page } = await setup(t, html);
+  await waitCounter(page, '1 / 1');
+  assert.equal((await state(page)).items.length, 80);
+  assert.equal(await page.locator('#ai-chat-outline-v1-host .outline-status').textContent(), '已加载 80 / 161 个标题');
+  await page.getByRole('button', { name: '加载更多（剩余 81 条）', exact: true }).click();
+  assert.equal((await state(page)).items.length, 160);
+  await page.getByRole('button', { name: '加载更多（剩余 1 条）', exact: true }).click();
+  assert.equal((await state(page)).items.length, 161);
+  assert.equal((await state(page)).items.at(-1), '条目 161');
+  assert.equal(await page.locator('#ai-chat-outline-v1-host .load-more').count(), 0);
+});
+
+test('流式正文刷新保留手动折叠和已加载页数', async (t) => {
+  const html = '<article data-role="assistant"><h1>章节</h1>' + Array.from({ length: 90 }, (_, index) => `<h2>小节 ${index + 1}</h2>`).join('') + '<p>正文</p></article>';
+  const { page } = await setup(t, html);
+  await waitCounter(page, '1 / 1');
+  await page.locator('#ai-chat-outline-v1-host .load-more').click();
+  await page.getByRole('button', { name: '折叠“章节”的子标题', exact: true }).click();
+  await page.evaluate(() => document.querySelector('p').textContent += '继续生成');
+  await page.waitForTimeout(450);
+  assert.deepEqual((await state(page)).items, ['章节']);
+  await page.getByRole('button', { name: '展开“章节”的子标题', exact: true }).click();
+  assert.equal((await state(page)).items.length, 91);
+});
+
+test('滚动至折叠且未加载的小节时展开路径并加载当前标题', async (t) => {
+  const html = '<article data-role="assistant"><h1>章节</h1><h2>部分</h2><h3>默认收起</h3>' + Array.from({ length: 90 }, (_, index) => `<h4 id="deep-${index}">深层 ${index + 1}</h4>`).join('') + '<div style="height:900px"></div></article>';
+  const { page } = await setup(t, html);
+  await waitCounter(page, '1 / 1');
+  assert.equal((await state(page)).items.length, 3);
+  await page.evaluate(() => document.getElementById('deep-89').scrollIntoView({ block: 'center' }));
+  await page.waitForFunction(() => document.getElementById('ai-chat-outline-v1-host').shadowRoot.querySelector('.item[data-index="92"]'));
+  assert.equal(await page.locator('#ai-chat-outline-v1-host .item.active').textContent(), '深层 90');
+});
+
+test('不同位置同名标题保留，不因文字相同吞掉结构', async (t) => {
+  const { page } = await setup(t, '<article data-role="assistant"><h2>总结</h2><h2>总结</h2></article>');
+  await waitCounter(page, '1 / 1');
+  assert.deepEqual((await state(page)).items, ['总结', '总结']);
+});
