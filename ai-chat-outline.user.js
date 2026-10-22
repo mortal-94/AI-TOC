@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         AI 聊天回答大纲（ChatGPT / 豆包）
 // @namespace    https://local.codex/ai-chat-outline
-// @version      1.0.5
+// @version      1.0.6
 // @description  为当前可见的 AI 回答生成侧边大纲；切换聊天时显示最后一个回答，滚动时自动切换。
 // @author       Codex
+// @homepageURL  https://github.com/mortal-94/AI-TOC
+// @supportURL   https://github.com/mortal-94/AI-TOC/issues
+// @downloadURL  https://raw.githubusercontent.com/mortal-94/AI-TOC/main/ai-chat-outline.user.js
+// @updateURL    https://raw.githubusercontent.com/mortal-94/AI-TOC/main/ai-chat-outline.user.js
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @match        https://www.doubao.com/chat*
@@ -21,6 +25,10 @@
   const ROUTE_SETTLE_MS = 700;
   const STORAGE_KEY = `${APP_ID}:collapsed`;
 
+  function readCollapsedState() {
+    try { return localStorage.getItem(STORAGE_KEY) === '1'; } catch { return false; }
+  }
+
   if (window.__AI_CHAT_OUTLINE__?.destroy) {
     window.__AI_CHAT_OUTLINE__.destroy();
   }
@@ -35,11 +43,13 @@
     routeKey: routeKey(),
     preferLastAnswer: true,
     preferLastUntil: 0,
-    collapsed: localStorage.getItem(STORAGE_KEY) === '1',
+    collapsed: readCollapsedState(),
     destroyed: false,
     scanTimer: 0,
     routeTimer: 0,
     scrollFrame: 0,
+    healthTimer: 0,
+    contentRoot: null,
     contentTextSignature: '',
     contentSignature: '',
     observer: null,
@@ -66,7 +76,24 @@
     '[class*="bot-message"]',
     '.list_items',
     '.v_list_row',
+    '[data-turn="assistant"]',
+    '[data-testid="assistant-message"]',
+    '[data-testid^="conversation-turn-"]',
+    '.markdown',
+    '[class*="markdown"]',
   ].join(',');
+
+  const CHATGPT_ASSISTANT_SELECTOR = [
+    '[data-message-author-role="assistant"]', '[data-role="assistant"]',
+    '[data-author="assistant"]', '[data-message-role="assistant"]',
+    '[data-turn="assistant"]', '[data-testid="assistant-message"]',
+  ].join(',');
+  const CHATGPT_USER_SELECTOR = [
+    '[data-message-author-role="user"]', '[data-role="user"]',
+    '[data-author="user"]', '[data-message-role="user"]',
+    '[data-turn="user"]', '[data-testid="user-message"]',
+  ].join(',');
+  const MARKDOWN_SELECTOR = '.markdown, [class*="markdown"], [class*="prose"]';
 
   function cleanText(value) {
     return String(value || '')
@@ -125,17 +152,24 @@
       label: 'ChatGPT',
       matches: () => /(^|\.)chatgpt\.com$|^chat\.openai\.com$/i.test(location.hostname),
       collectAnswers(root) {
-        const roles = [...root.querySelectorAll('[data-message-author-role="assistant"]')];
-        return uniqueElements(roles.map((role) =>
-          role.closest('article, [data-testid^="conversation-turn-"]') || role
-        )).filter((answer) => elementTextLength(answer) > 0);
+        const roles = [...root.querySelectorAll(CHATGPT_ASSISTANT_SELECTOR)]
+          .filter((element) => !element.closest('[hidden], [aria-hidden="true"]'));
+        // 保留最外层 assistant 节点，同一回答中的多个 markdown 片段统一提取。
+        const answers = roles.filter((role) => !roles.some((other) => other !== role && other.contains(role)));
+        // 兼容只保留 conversation-turn 标记的页面；明确排除用户消息。
+        const turns = [...root.querySelectorAll('main article, main [data-testid^="conversation-turn-"], [data-turn="assistant"]')];
+        for (const turn of turns) {
+          if (turn.closest('[hidden], [aria-hidden="true"]')) continue;
+          if (turn.matches(CHATGPT_USER_SELECTOR) || turn.querySelector(CHATGPT_USER_SELECTOR)) continue;
+          if (answers.some((answer) => turn.contains(answer) || answer.contains(turn))) continue;
+          if (turn.querySelector(MARKDOWN_SELECTOR)) answers.push(turn);
+        }
+        return uniqueElements(answers).filter((answer) => elementTextLength(answer) > 0)
+          .sort(domOrder);
       },
       getContent(answer) {
-        const role = answer.matches('[data-message-author-role="assistant"]')
-          ? answer
-          : answer.querySelector('[data-message-author-role="assistant"]');
-        const root = role || answer;
-        return root.querySelector('.markdown, [class*="markdown"], [class*="prose"]') || root;
+        // 不选第一个 markdown：流式回答可能拆分为多个正文片段。
+        return answer;
       },
     };
   }
@@ -240,8 +274,8 @@
     host.id = HOST_ID;
     host.setAttribute('data-ai-chat-outline-ui', '');
     const shadow = host.attachShadow({ mode: 'open' });
-    shadow.innerHTML = `
-      <style>
+    const style = document.createElement('style');
+    style.textContent = `
         :host { all: initial; }
         * { box-sizing: border-box; }
         .panel {
@@ -309,23 +343,30 @@
           .panel:not(.collapsed) { top: 62px; right: 8px; width: min(290px, calc(100vw - 16px)); max-height: calc(100vh - 82px); }
         }
         @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
-      </style>
-      <aside class="panel" aria-label="AI 回答大纲">
-        <div class="header">
-          <span class="logo" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 5h14M5 12h10M5 19h7"/><circle cx="3" cy="5" r=".8" fill="currentColor" stroke="none"/><circle cx="3" cy="12" r=".8" fill="currentColor" stroke="none"/><circle cx="3" cy="19" r=".8" fill="currentColor" stroke="none"/></svg>
-          </span>
-          <span class="title">回答大纲</span>
-          <span class="counter">等待回答</span>
-          <button class="icon-button collapse" type="button" title="折叠大纲" aria-label="折叠大纲">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
-          </button>
-        </div>
-        <div class="body"><div class="empty">正在识别当前聊天的回答…</div></div>
-        <div class="footer"><span class="site">AI Chat</span><span>滚动自动切换</span></div>
-      </aside>
     `;
-    document.documentElement.appendChild(host);
+    // 使用 DOM API 避开页面 require-trusted-types-for 'script' 的 HTML 写入限制。
+    const make = (tag, className, text) => {
+      const element = document.createElement(tag);
+      element.className = className;
+      if (text) element.textContent = text;
+      return element;
+    };
+    const panel = make('aside', 'panel');
+    panel.setAttribute('aria-label', 'AI 回答大纲');
+    const header = make('div', 'header');
+    const logo = make('span', 'logo', '≡');
+    logo.setAttribute('aria-hidden', 'true');
+    const counter = make('span', 'counter', '等待回答');
+    const collapse = make('button', 'icon-button collapse', '‹');
+    collapse.type = 'button';
+    const body = make('div', 'body');
+    body.append(make('div', 'empty', '正在识别当前聊天的回答…'));
+    const footer = make('div', 'footer');
+    footer.append(make('span', 'site', 'AI Chat'), make('span', '', '滚动自动切换'));
+    header.append(logo, make('span', 'title', '回答大纲'), counter, collapse);
+    panel.append(header, body, footer);
+    shadow.append(style, panel);
+    (document.body || document.documentElement).appendChild(host);
 
     state.host = host;
     state.shadow = shadow;
@@ -339,7 +380,7 @@
     applyCollapsedState();
     state.ui.collapse.addEventListener('click', () => {
       state.collapsed = !state.collapsed;
-      localStorage.setItem(STORAGE_KEY, state.collapsed ? '1' : '0');
+      try { localStorage.setItem(STORAGE_KEY, state.collapsed ? '1' : '0'); } catch { /* 页面禁用存储时仍可使用 */ }
       applyCollapsedState();
     });
   }
@@ -347,12 +388,14 @@
   function applyCollapsedState() {
     if (!state.ui) return;
     state.ui.panel.classList.toggle('collapsed', state.collapsed);
+    state.ui.collapse.textContent = state.collapsed ? '›' : '‹';
     const action = state.collapsed ? '展开大纲' : '折叠大纲';
     state.ui.collapse.title = action;
     state.ui.collapse.setAttribute('aria-label', action);
   }
 
   function isExcludedNode(element, contentRoot) {
+    if (element.closest('[hidden], [aria-hidden="true"], [data-testid*="thinking"], [data-testid*="reasoning"]')) return true;
     const excluded = element.closest(EXCLUDED_OUTLINE_SELECTOR);
     return Boolean(excluded && contentRoot.contains(excluded));
   }
@@ -449,9 +492,10 @@
       clearOldAnchors();
       state.items = [];
       state.activeItem = null;
+      state.contentRoot = null;
       state.contentTextSignature = '';
       state.contentSignature = '';
-      state.ui.body.innerHTML = '<div class="empty">当前聊天还没有可识别的 AI 回答。</div>';
+      showEmpty('当前聊天还没有可识别的 AI 回答。');
       return;
     }
 
@@ -459,11 +503,18 @@
     try { content = state.adapter.getContent(state.currentAnswer, document); } catch { content = state.currentAnswer; }
     content = content instanceof Element ? content : state.currentAnswer;
     const nextTextSignature = textSignature(content);
-    if (!force && nextTextSignature === state.contentTextSignature) return;
+    const targetsConnected = state.items.every((item) => item.element.isConnected && content.contains(item.element));
+    if (!force && content === state.contentRoot && targetsConnected && nextTextSignature === state.contentTextSignature) return;
 
     const nextItems = extractOutline(content);
-    const signature = `${nextTextSignature}:${nextItems.map((item) => item.text).join('|')}`;
-    if (!force && signature === state.contentSignature) return;
+    const signature = `${nextTextSignature}:${nextItems.map((item) => `${item.level}:${item.text}`).join('|')}`;
+    const sameTargets = nextItems.length === state.items.length
+      && nextItems.every((item, index) => item.element === state.items[index].element);
+    if (!force && sameTargets && signature === state.contentSignature) {
+      state.contentTextSignature = nextTextSignature;
+      state.contentRoot = content;
+      return;
+    }
 
     clearOldAnchors();
     state.items = nextItems;
@@ -471,11 +522,12 @@
       item.element.setAttribute(ANCHOR_ATTR, `${Date.now().toString(36)}-${index}`);
     });
     state.contentTextSignature = nextTextSignature;
+    state.contentRoot = content;
     state.contentSignature = signature;
     state.activeItem = null;
 
     if (!state.items.length) {
-      state.ui.body.innerHTML = '<div class="empty">当前回答没有可识别的标题。<br>仅显示正文标题和独立加粗短标题。</div>';
+      showEmpty('当前回答没有可识别的标题。仅显示正文标题和独立加粗短标题。');
       return;
     }
 
@@ -501,6 +553,13 @@
     });
     state.ui.body.replaceChildren(list);
     updateActiveOutlineItem();
+  }
+
+  function showEmpty(message) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = message;
+    state.ui.body.replaceChildren(empty);
   }
 
   function setActiveItem(item, ensureVisible = false) {
@@ -572,19 +631,19 @@
 
   function scan({ fromScroll = false } = {}) {
     if (state.destroyed) return;
+    onRouteMaybeChanged();
     selectAdapter();
 
-    if (fromScroll && state.answers.length && state.answers.every((answer) => answer.isConnected)) {
+    if (fromScroll && !state.preferLastAnswer && state.answers.length && state.answers.every((answer) => answer.isConnected)) {
       setCurrentAnswer(answerNearViewport());
       updateActiveOutlineItem();
       return;
     }
 
-    const previousAnswers = state.answers;
     state.answers = safeCollectAnswers();
 
     if (!state.answers.length) {
-      setCurrentAnswer(null, previousAnswers.length > 0);
+      setCurrentAnswer(null, true);
       return;
     }
 
@@ -615,8 +674,12 @@
   }
 
   function scheduleScan(delay = 120, options = {}) {
-    clearTimeout(state.scanTimer);
-    state.scanTimer = window.setTimeout(() => scan(options), delay);
+    // 连续流式变更不能无限推迟首次扫描。
+    if (state.scanTimer) return;
+    state.scanTimer = window.setTimeout(() => {
+      state.scanTimer = 0;
+      scan(options);
+    }, delay);
   }
 
   function onScroll(event) {
@@ -635,6 +698,8 @@
     state.preferLastAnswer = true;
     state.preferLastUntil = Date.now() + ROUTE_SETTLE_MS;
     state.currentAnswer = null;
+    clearTimeout(state.scanTimer);
+    state.scanTimer = 0;
     state.answers = [];
     clearOldAnchors();
     state.items = [];
@@ -653,12 +718,15 @@
         : record.target;
 
       if (target instanceof Element) {
+        if (target === state.host || state.host?.contains(target)) continue;
         if (state.currentAnswer?.contains(target)) return true;
         if (target.closest('.list_items')) return true;
+        if (target.closest(ANSWER_MARKER_SELECTOR)) return true;
       }
 
       for (const node of [...record.addedNodes, ...record.removedNodes]) {
         if (!(node instanceof Element)) continue;
+        if (node === state.host) continue;
         if (node.matches(ANSWER_MARKER_SELECTOR) || node.querySelector(ANSWER_MARKER_SELECTOR)) return true;
       }
     }
@@ -667,16 +735,19 @@
 
   function patchHistory() {
     const originals = { pushState: history.pushState, replaceState: history.replaceState };
+    const wrappers = {};
     for (const method of ['pushState', 'replaceState']) {
-      history[method] = function patchedHistory(...args) {
+      wrappers[method] = function patchedHistory(...args) {
         const result = originals[method].apply(this, args);
         queueMicrotask(onRouteMaybeChanged);
         return result;
       };
+      try { history[method] = wrappers[method]; } catch { /* 路由轮询兜底 */ }
     }
     state.restoreHistory = () => {
-      history.pushState = originals.pushState;
-      history.replaceState = originals.replaceState;
+      for (const method of ['pushState', 'replaceState']) {
+        if (history[method] === wrappers[method]) history[method] = originals[method];
+      }
     };
   }
 
@@ -685,6 +756,7 @@
     state.destroyed = true;
     clearTimeout(state.scanTimer);
     clearTimeout(state.routeTimer);
+    clearInterval(state.healthTimer);
     if (state.scrollFrame) clearTimeout(state.scrollFrame);
     state.observer?.disconnect();
     state.restoreHistory?.();
@@ -706,20 +778,32 @@
       const previousRoute = state.routeKey;
       onRouteMaybeChanged();
       if (previousRoute !== state.routeKey) return;
-      if (mutationMayAffectOutline(records)) scheduleScan(240);
+      if (mutationMayAffectOutline(records)) {
+        // 相同文本也可能换成了新的标题节点，不能继续使用旧点击目标。
+        state.contentTextSignature = '';
+        scheduleScan(240);
+      }
     });
-    state.observer.observe(document.body || document.documentElement, {
+    state.observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
       characterData: true,
+      attributes: true,
+      attributeFilter: ['data-message-author-role', 'data-message-role', 'data-role', 'data-author', 'data-turn', 'data-testid', 'class', 'hidden', 'aria-hidden', 'role', 'aria-level'],
     });
 
     window.addEventListener('popstate', onRouteMaybeChanged);
     window.addEventListener('hashchange', onRouteMaybeChanged);
     document.addEventListener('scroll', onScroll, { capture: true, passive: true });
+    state.healthTimer = window.setInterval(() => {
+      if (state.destroyed) return;
+      onRouteMaybeChanged();
+      if (!state.host?.isConnected) (document.body || document.documentElement).appendChild(state.host);
+      if (!state.answers.length || state.answers.some((answer) => !answer.isConnected)) scheduleScan(0);
+    }, 1000);
 
     const api = {
-      version: '1.0.5',
+      version: '1.0.6',
       registerAdapter,
       refresh: () => scheduleScan(0),
       destroy,

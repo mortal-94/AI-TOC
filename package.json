@@ -1,0 +1,12 @@
+{
+  "name": "ai-chat-outline",
+  "version": "1.0.6",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "check": "node --check ai-chat-outline.user.js"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
