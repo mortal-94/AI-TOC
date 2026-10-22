@@ -88,6 +88,16 @@ AIChatOutline.refresh()
 
 若更新至 1.0.7 后仍显示“暂无回答”，请将面板“识别诊断”中的 JSON 发来，便可定位具体缺失的结构。也可以在控制台执行 `AIChatOutline.getDiagnostics()`。
 
+## 1.0.8 新版 ChatGPT 虚拟消息布局
+
+- 支持 `data-turn-key` / `data-content-search-turn-key` / `data-talvt-turn-state` 消息结构。
+- 一个虚拟 turn 可以同时包含用户和 ChatGPT 消息：按 `sr-only` 说话人标签定位各自正文，只展示 ChatGPT 回答的大纲。
+- 从大纲中排除 `sr-only` 界面标签；不把“你说：”“ChatGPT 说：”当作标题。
+- 修正 Markdown 类名的子串误匹配：布局类 `[--entity-prose-inset:0px]` 不再被当成 `.prose` 正文。
+- 兼容 Markdown 在主节点本身的布局，已有消息边界时保持回答分离。
+
+此适配基于用户提供的实际 DOM 结构及中英文说话人标签建立回归测试，真实登录页的最终效果需更新后确认。
+
 ## 本地验证
 
 需要 Node.js 和 Playwright：

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 聊天回答大纲（ChatGPT / 豆包）
 // @namespace    https://local.codex/ai-chat-outline
-// @version      1.0.7
+// @version      1.0.8
 // @description  为当前可见的 AI 回答生成侧边大纲；切换聊天时显示最后一个回答，滚动时自动切换。
 // @author       Codex
 // @homepageURL  https://github.com/mortal-94/AI-TOC
@@ -19,7 +19,7 @@
   'use strict';
 
   const APP_ID = 'ai-chat-outline-v1';
-  const VERSION = '1.0.7';
+  const VERSION = '1.0.8';
   const HOST_ID = `${APP_ID}-host`;
   const ANCHOR_ATTR = 'data-ai-chat-outline-anchor';
   const MAX_ITEMS = 80;
@@ -81,7 +81,14 @@
     '[data-testid="assistant-message"]',
     '[data-testid^="conversation-turn-"]',
     '.markdown',
-    '[class*="markdown"]',
+    '.markdown-body',
+    '.prose',
+    '[class^="markdown-"]',
+    '[class*=" markdown-"]',
+    '[data-turn-key]',
+    '[data-content-search-turn-key]',
+    '[data-talvt-turn-state]',
+    '[data-virtualized-turn-content]',
   ].join(',');
 
   const CHATGPT_ASSISTANT_SELECTOR = [
@@ -94,7 +101,18 @@
     '[data-author="user"]', '[data-message-role="user"]',
     '[data-turn="user"]', '[data-testid="user-message"]',
   ].join(',');
-  const MARKDOWN_SELECTOR = '.markdown, [class*="markdown"], [class*="prose"]';
+  // 匹配 class token，而非任意子串；[--entity-prose-inset:0px] 不是正文标记。
+  const MARKDOWN_SELECTOR = '.markdown, .markdown-body, .prose, [class^="markdown-"], [class*=" markdown-"]';
+  const MESSAGE_BOUNDARY_SELECTOR = '[data-message-id], [data-turn-id], [data-testid^="conversation-turn-"], article';
+  const VIRTUAL_TURN_SELECTOR = '[data-talvt-turn-state], [data-content-search-turn-key], [data-turn-key]';
+  const SPEAKER_HEADING_SELECTOR = 'h1.sr-only, h2.sr-only, h3.sr-only, h4.sr-only, h5.sr-only, h6.sr-only';
+
+  function speakerRole(heading) {
+    const label = cleanText(heading.textContent);
+    if (/^(?:chatgpt|assistant)(?:\b|[\s：:])|^(?:助手|豆包)(?:\s|说|回复|[：:])/i.test(label)) return 'assistant';
+    if (/^(?:you|user)(?:\b|[\s：:])|^(?:你|您|用户)(?:\s|说|问|[：:])/i.test(label)) return 'user';
+    return '';
+  }
 
   function isHiddenMessage(element) {
     // aria-hidden 仅控制无障碍树；ChatGPT 的可见聊天也可能位于这种容器内。
@@ -162,6 +180,16 @@
           .filter((element) => !isHiddenMessage(element));
         // 保留最外层 assistant 节点，同一回答中的多个 markdown 片段统一提取。
         const answers = roles.filter((role) => !roles.some((other) => other !== role && other.contains(role)));
+        // 新版虚拟聊天去掉了 author-role/markdown，通过消息中的说话人标签区分回答。
+        // 标签父节点是消息正文边界；同一虚拟 turn 可以同时包含用户和 AI 消息。
+        for (const heading of root.querySelectorAll(SPEAKER_HEADING_SELECTOR)) {
+          if (!heading.closest(VIRTUAL_TURN_SELECTOR) || speakerRole(heading) !== 'assistant') continue;
+          const message = heading.parentElement;
+          if (!message || isHiddenMessage(message)) continue;
+          if (message.matches(CHATGPT_USER_SELECTOR) || message.querySelector(CHATGPT_USER_SELECTOR)) continue;
+          if (answers.some((answer) => answer.contains(message) || message.contains(answer))) continue;
+          answers.push(message);
+        }
         // 兼容只保留 conversation-turn 标记的页面；明确排除用户消息。
         const turns = [...root.querySelectorAll('main article, main [data-testid^="conversation-turn-"], [data-turn="assistant"]')];
         for (const turn of turns) {
@@ -174,13 +202,22 @@
         // 逐段回溯至消息边界，既不依赖具体标签名，也不跨越用户消息。
         const mainRoots = [...root.querySelectorAll('main, [role="main"], #thread')];
         for (const main of mainRoots) {
-          for (const markdown of main.querySelectorAll(MARKDOWN_SELECTOR)) {
+          const markdownRoots = [...(main.matches(MARKDOWN_SELECTOR) ? [main] : []), ...main.querySelectorAll(MARKDOWN_SELECTOR)];
+          const candidates = markdownRoots.flatMap((markdown) => {
+            if (markdown !== main) return [markdown];
+            const boundaries = [...main.querySelectorAll(MESSAGE_BOUNDARY_SELECTOR)].filter((node) => {
+              const ancestor = node.parentElement?.closest(MESSAGE_BOUNDARY_SELECTOR);
+              return !ancestor || ancestor === main || !main.contains(ancestor);
+            });
+            return boundaries.length ? boundaries : [markdown];
+          });
+          for (const markdown of candidates) {
             if (isHiddenMessage(markdown) || markdown.closest(CHATGPT_USER_SELECTOR)) continue;
             if (markdown.closest(EXCLUDED_OUTLINE_SELECTOR)) continue;
             const markdownParent = markdown.parentElement?.closest(MARKDOWN_SELECTOR);
             if (markdownParent && markdownParent !== main && main.contains(markdownParent)) continue;
             if (answers.some((answer) => answer.contains(markdown) || markdown.contains(answer))) continue;
-            const boundary = markdown.closest('[data-message-id], [data-turn-id], [data-testid^="conversation-turn-"], article');
+            const boundary = markdown.closest(MESSAGE_BOUNDARY_SELECTOR);
             const answer = boundary && main.contains(boundary)
               && !boundary.matches(CHATGPT_USER_SELECTOR) && !boundary.querySelector(CHATGPT_USER_SELECTOR)
               ? boundary : markdown;
@@ -418,6 +455,7 @@
   }
 
   function isExcludedNode(element, contentRoot) {
+    if (element.closest('.sr-only')) return true;
     if (element.closest('[hidden]:not([hidden="until-found"]), [data-testid*="thinking"], [data-testid*="reasoning"]')) return true;
     const excluded = element.closest(EXCLUDED_OUTLINE_SELECTOR);
     return Boolean(excluded && contentRoot.contains(excluded));
@@ -615,6 +653,9 @@
       mainRegions: count('main, [role="main"], #thread'),
       headings: count('main h1, main h2, main h3, main h4, main h5, main h6, [role="main"] [role="heading"]'),
       frames: count('iframe'),
+      virtualTurnGroups: count('[data-talvt-turn-state]'),
+      speakerHeaders: count(SPEAKER_HEADING_SELECTOR),
+      assistantSpeakerHeaders: [...document.querySelectorAll(SPEAKER_HEADING_SELECTOR)].filter((heading) => speakerRole(heading) === 'assistant').length,
     };
   }
 
@@ -845,7 +886,7 @@
       subtree: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ['data-message-author-role', 'data-message-role', 'data-role', 'data-author', 'data-turn', 'data-testid', 'class', 'hidden', 'aria-hidden', 'role', 'aria-level'],
+      attributeFilter: ['data-message-author-role', 'data-message-role', 'data-role', 'data-author', 'data-turn', 'data-testid', 'class', 'hidden', 'aria-hidden', 'role', 'aria-level', 'data-turn-key', 'data-content-search-turn-key', 'data-talvt-turn-state', 'data-virtualized-turn-content'],
     });
 
     window.addEventListener('popstate', onRouteMaybeChanged);
